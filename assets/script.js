@@ -8,16 +8,10 @@ ws.onclose = (event) =>
   console.log('WebSocket connection was terminated:', event)
 
 const start_connection = async (ws) => {
-  const videoPlayer = document.getElementById('videoPlayer')
-  videoPlayer.srcObject = new MediaStream()
-
   const pc = new RTCPeerConnection(pcConfig)
+
   pc.ontrack = (event) => {
     console.log('Received remote track:', event.track)
-
-    // This adds the local track to the local video. we shouldn't receive our stream back, because we should filter it
-    // ont he server but if we do we'd want to ignore it.
-    videoPlayer.srcObject.addTrack(event.track)
 
     if (event.track.kind === 'audio') {
       return
@@ -46,16 +40,33 @@ const start_connection = async (ws) => {
     ws.send(JSON.stringify({ type: 'ice', data: event.candidate }))
   }
 
+  const localVideo = document.getElementById('localVideo')
+
   const localStream =
     await navigator.mediaDevices.getUserMedia(mediaConstraints)
+
   for (const track of localStream.getTracks()) {
     pc.addTrack(track, localStream)
   }
+
+  localVideo.srcObject = localStream
 
   ws.onmessage = async (event) => {
     const { type, data } = JSON.parse(event.data)
 
     switch (type) {
+      case 'offer':
+        console.log('Received SDP offer:', data)
+        await pc.setRemoteDescription(data)
+
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        console.log('Sent SDP answer:', answer)
+        ws.send(JSON.stringify({ type: 'answer', data: answer }))
+
+        break
+
       case 'answer':
         console.log('Received SDP answer:', data)
         await pc.setRemoteDescription(data)

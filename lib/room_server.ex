@@ -1,7 +1,13 @@
+defmodule SFU.Peer do
+  defstruct [
+    :ws_pid,
+    :peer_uuid
+  ]
+end
+
 defmodule SFU.RoomServer do
   use GenServer
 
-  # peers: start as list of pids but add struct later
   defstruct [
     :name,
     :peers
@@ -12,16 +18,22 @@ defmodule SFU.RoomServer do
   end
 
   # todo: add registry
-  def add_peer(pid, peer) do
-    GenServer.cast(pid, {:add_peer, peer})
+  # todo: add supervision and ability to have this not be a singleton
+  def add_peer(pid, ws_pid, uuid) do
+    new_peer = %SFU.Peer{ws_pid: ws_pid, peer_uuid: uuid}
+    GenServer.cast(pid, {:add_peer, new_peer})
   end
 
-  def receive_video_packet(pid, {incoming_peer_pid, track_id, packet}) do
-    GenServer.cast(pid, {:receive_video_packet, {incoming_peer_pid, track_id, packet}})
+  def get_peers(pid) do
+    GenServer.call(pid, :get_peers)
   end
 
-  def receive_audio_packet(pid, {incoming_peer_pid, track_id, packet}) do
-    GenServer.cast(pid, {:receive_audio_packet, {incoming_peer_pid, track_id, packet}})
+  def receive_video_packet(pid, {incoming_peer_pid, incoming_uuid, packet}) do
+    GenServer.cast(pid, {:receive_video_packet, {incoming_peer_pid, incoming_uuid, packet}})
+  end
+
+  def receive_audio_packet(pid, {incoming_peer_pid, incoming_uuid, packet}) do
+    GenServer.cast(pid, {:receive_audio_packet, {incoming_peer_pid, incoming_uuid, packet}})
   end
 
   @impl GenServer
@@ -32,34 +44,28 @@ defmodule SFU.RoomServer do
   end
 
   @impl GenServer
+  def handle_call(:get_peers, _from, state) do
+    {:reply, state.peers, state}
+  end
+
+  @impl GenServer
   def handle_cast({:add_peer, peer}, state) do
     new_state = %{state | peers: [peer | state.peers]}
-    dbg("adding peer")
-    dbg(new_state)
     {:noreply, new_state}
   end
 
   @impl GenServer
-  def handle_cast({:receive_video_packet, {incoming_peer_pid, track_id, packet}}, state) do
-    # todo filter out not this pid
-    # for peer <- state.peers, peer != incoming_peer_pid do
-    for peer <- state.peers do
-      # from = nil
-      # msg = {:rtp, track_id, packet}
-      # dbg("sending audio packet to peer: #{inspect(peer)}")
-      send(peer, {:distribute_video_packet, track_id, packet})
+  def handle_cast({:receive_video_packet, {incoming_peer_pid, incoming_uuid, packet}}, state) do
+    for %{ws_pid: ws_pid, peer_uuid: peer_uuid} <- state.peers, peer_uuid != incoming_peer_pid do
+      send(ws_pid, {:distribute_video_packet, incoming_uuid, packet})
     end
 
     {:noreply, state}
   end
 
-  def handle_cast({:receive_audio_packet, {incoming_peer_pid, track_id, packet}}, state) do
-    # for peer <- state.peers, peer != incoming_peer_pid do
-    for peer <- state.peers do
-      # from = nil
-      # msg = {:rtp, track_id, packet}
-      # dbg("sending video packet to peer: #{inspect(peer)}")
-      send(peer, {:distribute_audio_packet, track_id, packet})
+  def handle_cast({:receive_audio_packet, {incoming_peer_pid, incoming_uuid, packet}}, state) do
+    for %{ws_pid: ws_pid, peer_uuid: peer_uuid} <- state.peers, peer_uuid != incoming_peer_pid do
+      send(ws_pid, {:distribute_audio_packet, incoming_uuid, packet})
     end
 
     {:noreply, state}

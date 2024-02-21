@@ -26,8 +26,8 @@ defmodule SFU.MixProject do
       {:bandit, "~> 1.2.0"},
       {:websock_adapter, "~> 0.5.0"},
       {:jason, "~> 1.4.0"},
-      # {:ex_webrtc, "~> 0.1.0"}
-      {:ex_webrtc, path: "../ex_webrtc"}
+      {:uuid, "~> 1.1"},
+      {:ex_webrtc, "~> 0.1.0"}
     ]
   end
 end
