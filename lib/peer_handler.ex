@@ -52,6 +52,9 @@ defmodule SFU.PeerHandler do
       uuid: uuid,
       peer_connection: pc,
       connection_state: nil,
+      out_video_tracks: %{},
+      out_audio_tracks: %{},
+      pending_track_edits: false,
       pending_answer: false,
       outgoing_video_tracks: [],
       outgoing_audio_tracks: [],
@@ -60,6 +63,20 @@ defmodule SFU.PeerHandler do
     }
 
     SFU.RoomServer.add_peer(:room_server, self(), pc, nil, nil, uuid)
+
+    {:ok, state}
+  end
+
+
+  def handle_info({:add_other_tracks}, state) do
+    state =
+      for %{ws_pid: ws_pid, in_video_track_id: vid, peer_uuid: _peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
+        ws_pid != self(),
+        reduce: state do
+        state ->
+          in_track_id = vid
+          add_local_track(state, :video, state.uuid, in_track_id)
+    end
 
     {:ok, state}
   end
@@ -163,25 +180,14 @@ defmodule SFU.PeerHandler do
       send(ws_pid, {:add_local_track, kind, state.uuid, id})
     end
 
-    # Loop through every other peer, and add a track to thie peer to write the other peers packets to.
-    state =
-      for %{ws_pid: ws_pid, in_video_track_id: vid, in_audio_track_id: aid, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
-          ws_pid != self(),
-          reduce: state do
-        state ->
-          in_track_id =
-            case kind do
-              :video -> vid
-              :audio -> aid
-            end
-          add_local_track(state, kind, state.uuid, in_track_id)
-      end
+    # # Loop through every other peer, and add a track to thie peer to write the other peers packets to.
+    Process.send_after(self(), {:add_other_tracks}, 500)
 
     {:ok, state}
   end
 
   defp handle_webrtc_msg({:rtp, id, packet}, %{in_audio_track_id: id} = state) do
-    # audio disabled for testing
+    # SFU.RoomServer.receive_audio_packet(:room_server, {self(), state.uuid, packet})
     {:ok, state}
   end
 
@@ -197,6 +203,12 @@ defmodule SFU.PeerHandler do
     {:ok, state}
   end
 
+  def handle_info({:signal}, state) do
+    msg = do_offer(state)
+
+    {:push, {:text, msg}, state}
+  end
+
   defp handle_webrtc_msg({:connection_state_change, connection_state}, state) do
     Logger.info("Connection state changed to #{connection_state} for: #{state.uuid}")
 
@@ -204,6 +216,8 @@ defmodule SFU.PeerHandler do
 
     case connection_state do
       :connected ->
+        # once connected, trigger the offer
+
         {:ok, state}
 
       _ ->
@@ -212,11 +226,17 @@ defmodule SFU.PeerHandler do
   end
 
   defp handle_webrtc_msg(:negotiation_needed, state) do
+    # {:ok, state}
+    # dbg state
     if state.pending_answer do
-      IO.puts("pending offer")
+      IO.puts("👻 pending offer")
+      IO.puts("👻 pending offer")
+      IO.puts("👻 pending offer")
+      IO.puts("👻 pending offer")
       {:ok, state}
     else
       IO.puts("firing renegotiation for #{inspect(state.uuid)}")
+
 
       case state.connection_state do
         :connected ->
@@ -225,7 +245,8 @@ defmodule SFU.PeerHandler do
           {:push, {:text, msg}, state}
 
         _ ->
-          # do something? retrigger in a few seconds?
+          Process.send_after(self(), {:ex_webrtc, self(), :negotiation_needed}, 50)
+
           {:ok, state}
       end
 
