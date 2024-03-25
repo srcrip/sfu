@@ -1,6 +1,10 @@
-const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-const mediaConstraints = { video: true, audio: true }
+const pcConfig = { iceServers: [] }
+// just need host candidate for testing locally
+// const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+const mediaConstraints = { video: true, audio: false }
 const address = 'ws://localhost:7001/ws'
+
+let pendingAnswer = false
 
 const ws = new WebSocket(address)
 ws.onopen = (_) => start_connection(ws)
@@ -9,6 +13,7 @@ ws.onclose = (event) =>
 
 const start_connection = async (ws) => {
   const pc = new RTCPeerConnection(pcConfig)
+  window.pc = pc
 
   pc.ontrack = (event) => {
     console.log('Received remote track:', event.track)
@@ -39,6 +44,15 @@ const start_connection = async (ws) => {
     console.log('Sent ICE candidate:', event.candidate)
     ws.send(JSON.stringify({ type: 'ice', data: event.candidate }))
   }
+  pc.onnegotiationneeded = async (_) => {
+    console.log('Negotiation needed: unsure if need to fire from here? it kinda breaks things if i do...')
+    // if (!pendingAnswer) {
+    // const offer = await pc.createOffer()
+    // await pc.setLocalDescription(offer)
+    // console.log('Sent SDP offer:', offer)
+    // ws.send(JSON.stringify({ type: 'offer', data: offer }))
+    // }
+  }
 
   const localVideo = document.getElementById('localVideo')
 
@@ -68,6 +82,7 @@ const start_connection = async (ws) => {
         break
 
       case 'answer':
+        pendingAnswer = false
         console.log('Received SDP answer:', data)
         await pc.setRemoteDescription(data)
         break
@@ -77,6 +92,7 @@ const start_connection = async (ws) => {
     }
   }
 
+  pendingAnswer = true
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   console.log('Sent SDP offer:', offer)

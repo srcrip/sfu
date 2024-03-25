@@ -1,3 +1,7 @@
+defmodule SFU.RemoteTrack do
+  defstruct [:kind, :peer_pid, :peer_uuid, :in_track_id, :out_track]
+end
+
 defmodule SFU.PeerHandler do
   require Logger
 
@@ -11,8 +15,9 @@ defmodule SFU.PeerHandler do
 
   @behaviour WebSock
 
+  # just need host candidate for testing locally
   @ice_servers [
-    %{urls: "stun:stun.l.google.com:19302"}
+    # %{urls: "stun:stun.l.google.com:19302"}
   ]
 
   @video_codecs [
@@ -46,13 +51,15 @@ defmodule SFU.PeerHandler do
     state = %{
       uuid: uuid,
       peer_connection: pc,
-      out_video_tracks: %{},
-      out_audio_tracks: %{},
+      connection_state: nil,
+      pending_answer: false,
+      outgoing_video_tracks: [],
+      outgoing_audio_tracks: [],
       in_video_track_id: nil,
       in_audio_track_id: nil
     }
 
-    SFU.RoomServer.add_peer(:room_server, self(), uuid)
+    SFU.RoomServer.add_peer(:room_server, self(), pc, nil, nil, uuid)
 
     {:ok, state}
   end
@@ -64,52 +71,14 @@ defmodule SFU.PeerHandler do
     |> handle_ws_msg(state)
   end
 
-  @impl true
-  def handle_info({:add_outgoing_tracks, uuid}, state) do
-    IO.puts("Adding outgoing tracks for #{uuid}")
-
-    video_track = MediaStreamTrack.new(:video)
-    audio_track = MediaStreamTrack.new(:audio)
-
-    {:ok, _sender} = PeerConnection.add_track(state.peer_connection, video_track)
-    {:ok, _sender} = PeerConnection.add_track(state.peer_connection, audio_track)
-
-    video_tracks =
-      state.out_video_tracks
-      |> Map.update(uuid, [video_track], fn tracks -> [video_track | tracks] end)
-
-    audio_tracks =
-      state.out_audio_tracks
-      |> Map.update(uuid, [audio_track], fn tracks -> [audio_track | tracks] end)
-
-    new_state = %{
-      state
-      | out_video_tracks: video_tracks,
-        out_audio_tracks: audio_tracks
-    }
-
-    {:ok, new_state}
+  def handle_info({:add_local_track, kind, uuid, in_track_id}, state) do
+    Logger.info("in the handle info for local track")
+    {:ok, add_local_track(state, kind, uuid, in_track_id)}
   end
 
   @impl true
   def handle_info({:ex_webrtc, _from, msg}, state) do
     handle_webrtc_msg(msg, state)
-  end
-
-  def handle_info({:distribute_video_packet, uuid, packet}, state) do
-    for track <- Map.get(state.out_video_tracks, uuid, []) do
-      PeerConnection.send_rtp(state.peer_connection, track.id, packet)
-    end
-
-    {:ok, state}
-  end
-
-  def handle_info({:distribute_audio_packet, uuid, packet}, state) do
-    for track <- Map.get(state.out_audio_tracks, uuid, []) do
-      PeerConnection.send_rtp(state.peer_connection, track.id, packet)
-    end
-
-    {:ok, state}
   end
 
   @impl true
@@ -118,7 +87,14 @@ defmodule SFU.PeerHandler do
   end
 
   defp handle_ws_msg(%{"type" => "answer", "data" => data}, state) do
-    Logger.info("Received SDP answer: #{inspect(data)}")
+    Logger.info("Received SDP answer for: #{state.uuid}")
+
+    if state.in_video_track_id == nil do
+      dbg "waiting for video track"
+      Process.sleep(1000)
+    end
+
+    state = %{state | pending_answer: false}
 
     answer = SessionDescription.from_json(data)
     :ok = PeerConnection.set_remote_description(state.peer_connection, answer)
@@ -127,24 +103,7 @@ defmodule SFU.PeerHandler do
   end
 
   defp handle_ws_msg(%{"type" => "offer", "data" => data}, state) do
-    Logger.info("Received SDP offer: #{inspect(data)}")
-
-    # before we answer, we will:
-    # 1. loop through every other peer and add a local track to them. We will write this peers packets to those tracks.
-    # 2. loop through every other peer, add a local track to this peer. We will write the other peers outgoing packets onto this one.
-
-    for %{ws_pid: ws_pid, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
-        ws_pid != self() do
-      send(ws_pid, {:add_outgoing_tracks, state.uuid})
-    end
-
-    state =
-      for %{ws_pid: ws_pid, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
-          ws_pid != self(),
-          reduce: state do
-        state ->
-          add_local_tracks(state, state.uuid)
-      end
+    Logger.info("Received SDP offer for: #{state.uuid}")
 
     offer = SessionDescription.from_json(data)
     :ok = PeerConnection.set_remote_description(state.peer_connection, offer)
@@ -158,13 +117,13 @@ defmodule SFU.PeerHandler do
       %{"type" => "answer", "data" => answer_json}
       |> Jason.encode!()
 
-    Logger.info("Sent SDP answer: #{inspect(answer_json)}")
+    Logger.info("Sent SDP answer for: #{state.uuid}")
 
     {:push, {:text, msg}, state}
   end
 
   defp handle_ws_msg(%{"type" => "ice", "data" => data}, state) do
-    Logger.info("Received ICE candidate: #{inspect(data)}")
+    Logger.info("Received ICE candidate for: #{state.uuid}")
 
     candidate = ICECandidate.from_json(data)
     :ok = PeerConnection.add_ice_candidate(state.peer_connection, candidate)
@@ -178,7 +137,7 @@ defmodule SFU.PeerHandler do
       %{"type" => "ice", "data" => candidate_json}
       |> Jason.encode!()
 
-    Logger.info("Sent ICE candidate: #{inspect(candidate_json)}")
+    Logger.info("Sent ICE candidate from: #{state.uuid}")
 
     {:push, {:text, msg}, state}
   end
@@ -194,22 +153,109 @@ defmodule SFU.PeerHandler do
         :audio -> %{state | in_audio_track_id: id}
       end
 
+    SFU.RoomServer.add_track_to_peer(:room_server, state.peer_connection, kind, id)
+
+    # Loop through every other peer, and add a track to them to write this peers packets to.
+    for %{ws_pid: ws_pid, in_video_track_id: vid, in_audio_track_id: aid, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
+      ws_pid != self() do
+
+      # Process.sleep(500)
+      send(ws_pid, {:add_local_track, kind, state.uuid, id})
+    end
+
+    # Loop through every other peer, and add a track to thie peer to write the other peers packets to.
+    state =
+      for %{ws_pid: ws_pid, in_video_track_id: vid, in_audio_track_id: aid, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
+          ws_pid != self(),
+          reduce: state do
+        state ->
+          in_track_id =
+            case kind do
+              :video -> vid
+              :audio -> aid
+            end
+          add_local_track(state, kind, state.uuid, in_track_id)
+      end
+
     {:ok, state}
   end
 
   defp handle_webrtc_msg({:rtp, id, packet}, %{in_audio_track_id: id} = state) do
-    SFU.RoomServer.receive_audio_packet(:room_server, {self(), state.uuid, packet})
+    # audio disabled for testing
     {:ok, state}
   end
 
   defp handle_webrtc_msg({:rtp, id, packet}, %{in_video_track_id: id} = state) do
-    SFU.RoomServer.receive_video_packet(:room_server, {self(), state.uuid, packet})
+    for %{ws_pid: ws_pid, pc_pid: pc, outgoing_video_tracks: ts, peer_uuid: peer_uuid} <- SFU.RoomServer.get_peers(:room_server),
+      ts != nil,
+      ws_pid != self(),
+      t <- ts,
+      t.in_track_id == id do
+      PeerConnection.send_rtp(pc, t.out_track.id, packet)
+    end
+
     {:ok, state}
   end
 
-  defp handle_webrtc_msg(:negotiation_needed, state) do
-    IO.puts("firing renegotiation for #{inspect(state.uuid)}")
+  defp handle_webrtc_msg({:connection_state_change, connection_state}, state) do
+    Logger.info("Connection state changed to #{connection_state} for: #{state.uuid}")
 
+    state = %{state | connection_state: connection_state}
+
+    case connection_state do
+      :connected ->
+        {:ok, state}
+
+      _ ->
+        {:ok, state}
+    end
+  end
+
+  defp handle_webrtc_msg(:negotiation_needed, state) do
+    if state.pending_answer do
+      IO.puts("pending offer")
+      {:ok, state}
+    else
+      IO.puts("firing renegotiation for #{inspect(state.uuid)}")
+
+      case state.connection_state do
+        :connected ->
+          msg = do_offer(state)
+
+          {:push, {:text, msg}, state}
+
+        _ ->
+          # do something? retrigger in a few seconds?
+          {:ok, state}
+      end
+
+    end
+  end
+
+  defp handle_webrtc_msg(_msg, state), do: {:ok, state}
+
+  defp add_local_track(state, kind, uuid, in_track_id) do
+    IO.puts("👻 Adding local track for #{inspect(state.uuid)}")
+
+    video_track = MediaStreamTrack.new(kind)
+
+    {:ok, _sender} = PeerConnection.add_track(state.peer_connection, video_track)
+
+    outgoing_track = %SFU.RemoteTrack{kind: kind, peer_pid: state.peer_connection, peer_uuid: uuid, in_track_id: in_track_id, out_track: video_track}
+
+    case kind do
+      :video ->
+        tracks = [outgoing_track | state.outgoing_video_tracks]
+        SFU.RoomServer.set_outgoing_track(:room_server, state.peer_connection, tracks)
+        %{state | outgoing_video_tracks: tracks}
+
+      :audio ->
+        tracks = [outgoing_track | state.outgoing_audio_tracks]
+        %{state | outgoing_audio_tracks: tracks}
+    end
+  end
+
+  defp do_offer(state) do
     {:ok, offer} = PeerConnection.create_offer(state.peer_connection)
     :ok = PeerConnection.set_local_description(state.peer_connection, offer)
 
@@ -219,34 +265,8 @@ defmodule SFU.PeerHandler do
       %{"type" => "offer", "data" => offer_json}
       |> Jason.encode!()
 
-    Logger.info("Sent SDP offer: #{inspect(offer_json)}")
+    Logger.info("Sent SDP offer from: #{state.uuid}")
 
-    {:push, {:text, msg}, state}
-  end
-
-  defp handle_webrtc_msg(_msg, state), do: {:ok, state}
-
-  defp add_local_tracks(state, uuid) do
-    video_track = MediaStreamTrack.new(:video)
-    audio_track = MediaStreamTrack.new(:audio)
-
-    {:ok, _sender} = PeerConnection.add_track(state.peer_connection, video_track)
-    {:ok, _sender} = PeerConnection.add_track(state.peer_connection, audio_track)
-
-    video_tracks =
-      state.out_video_tracks
-      |> Map.update(uuid, [video_track], fn tracks -> [video_track | tracks] end)
-
-    audio_tracks =
-      state.out_audio_tracks
-      |> Map.update(uuid, [audio_track], fn tracks -> [audio_track | tracks] end)
-
-    new_state = %{
-      state
-      | out_video_tracks: video_tracks,
-        out_audio_tracks: audio_tracks
-    }
-
-    new_state
+    msg
   end
 end
